@@ -5,11 +5,12 @@ import time
 import math
 
 
-class VisualiseFrequency(QtCore.QThread):
+class VisualiseFFT(QtCore.QThread):
 
-    def __init__(self, song, canvas, player):
+    def __init__(self, song, canvas, player, *, polar=False):
         super().__init__()
         self.canvas = canvas
+        self.polar = polar
         self.figure = self.canvas.figure
         self.player = player
         self.samples = np.array(song.get_array_of_samples())
@@ -17,7 +18,7 @@ class VisualiseFrequency(QtCore.QThread):
 
     def run(self):
         self.figure.patch.set_facecolor((0, 0, 0))
-        ax1 = self.figure.add_subplot(1,1,1)
+        ax1 = self.figure.add_subplot(111, polar=self.polar)
         ax1.set_facecolor((0, 0, 0))
         
         interval = 0.05
@@ -64,13 +65,25 @@ class VisualiseFrequency(QtCore.QThread):
                     bars[n] = amp
                     if bars[n] < 1:
                             bars[n] = 0
+
             ax1.clear()
+            ax1.grid(False)
+            ax1.set_yticklabels([])
+            
+            thetas = np.arange(0, math.pi*2, (2*math.pi)/len(bars))
+            rs = bars
+            if self.polar:
+                thetas = np.append(thetas, 0)
+                rs = np.append(rs, rs[0]) + max_sample/5
+            
             if ax1.lines:
-                ax1.lines[0].set_data(range(len(bars)), bars)
+                ax1.lines[0].set_data(thetas, rs)
             else:
-                ax1.plot(range(len(bars)), bars, color='r')
+                ax1.plot(thetas, rs, color='r')
             ax1.set_ylim(top=max_sample, bottom=0)
-            ax1.fill_between(range(len(bars)), bars, color='#c60303')
+            if self.polar:
+                ax1.set_rmax(max_sample)
+            ax1.fill_between(thetas, rs, color='#c60303')
             self.canvas.draw()
             plt.pause(0.001)
             time.sleep(max(interval - time.time() + start, 0))
