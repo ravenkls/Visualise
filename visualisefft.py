@@ -1,89 +1,157 @@
 import matplotlib.pyplot as plt
+from progressbar import progressbar
+import cv2
 from PyQt5 import QtCore
+from pydub import AudioSegment
 import numpy as np
 import time
 import math
+import os
+import io
+import pdb
+import subprocess
+import itertools
+from PIL import Image, ImageFilter, ImageSequence
 
 
 class VisualiseFFT(QtCore.QThread):
 
-    def __init__(self, song, canvas, player, *, polar=False):
+    progress = QtCore.pyqtSignal(float)
+
+    def __init__(self, audio_file, video_output, **options):
         super().__init__()
-        self.canvas = canvas
-        self.polar = polar
-        self.figure = self.canvas.figure
-        self.player = player
-        self.samples = np.array(song.get_array_of_samples())
-        self.song = song
+        self.audio_file = audio_file
+        self.video_output = video_output
+        self.song = AudioSegment.from_file(self.audio_file)
+        self.song = self.song.set_channels(1)
+        self.samples = np.array(self.song.get_array_of_samples())
+        self.max_sample = self.samples.max()
+        self.polar = options.get('polar', False)
+        self.interval = options.get('interval', 0.05)
+        self.resolution = options.get('resolution', 60)
+        self.amplify_factor = options.get('amplify_factor', 4)
+        self.stroke_colour = options.get('stroke_colour', (27, 142, 123))
+        self.fill_colour = options.get('fill_colour', (25, 214, 183))
+        self.background_file = options.get('background', None)
+        self.background_zoom = options.get('background_zoom', 1.1)
+        self.particles_file = options.get('particles', 'particles.gif')
+        self.particles_image = Image.open(self.particles_file)
+        self.particle_frames = itertools.cycle(ImageSequence.Iterator(self.particles_image))
+        if self.background_file:
+            self.background_image = Image.open(self.background_file).filter(ImageFilter.BLUR)
+        else:
+            self.background_image = Image.new('RGBA', (1920, 1080), (255, 255, 255, 255))
+
+    def zoom_background(self, image, factor):
+        enlarged = image.resize((int(image.width*factor), int(image.height*factor)))
+        left = int((factor - 1)/2 * image.width)
+        top = int((factor - 1)/2 * image.height)
+        right = enlarged.width - left
+        bottom = enlarged.height - top
+        cropped = enlarged.crop((left, top, right, bottom))
+        cropped.resize((image.width, image.height))
+        return cropped
+
 
     def run(self):
-        self.figure.patch.set_facecolor((0, 0, 0))
-        ax1 = self.figure.add_subplot(111, polar=self.polar)
-        ax1.set_facecolor((0, 0, 0))
-        
-        interval = 0.05
-        bars_n = 60
+        self.figure = plt.figure(figsize=(19.2, 10.8), dpi=100)
+        ax = self.figure.add_subplot(111, polar=self.polar)
 
-        frequency_range = 1
+        matplotlib_stroke = [colour/255 for colour in self.stroke_colour]
+        matplotlib_fill = [colour/255 for colour in self.fill_colour]
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video = cv2.VideoWriter('tmp.mp4', fourcc, 1/self.interval, (1920, 1080))
         
-        bars = np.zeros(bars_n)
-        max_sample = self.samples.max()
-        for timestamp in range(0, math.ceil(self.song.duration_seconds/interval)):
-            start = time.time()
+        est_mean = np.mean(self.samples)
+        est_std = 3 * np.std(self.samples) / np.sqrt(2)
+        bass_frequency = int(round((est_std - est_mean) * 0.05))
+
+        bars = np.zeros(self.resolution)
+        sample_count = int(self.song.frame_rate * self.interval)
+
+        current_background_zoom = 0
+        for timestamp in np.arange(0, self.song.duration, self.interval):
             
-            timestamp *= interval
-            sample_count = int(self.song.frame_rate * interval)
-            start_index = int((self.player.position()/1000) * self.song.frame_rate)
-            v_sample = self.samples[start_index:start_index+sample_count]
+            sample_index = int(timestamp * self.song.frame_rate)
+            v_sample = self.samples[sample_index:sample_index+sample_count]
 
             fourier = np.fft.fft(v_sample)
-            freq = np.fft.fftfreq(fourier.size, d=interval)
+            freq = np.fft.fftfreq(fourier.size, d=self.interval)
             amps = 2/v_sample.size * np.abs(fourier)
             data = np.array([freq, amps]).T
-            
-            bar_width_range = frequency_range / bars_n
-            bars_samples = np.array([])
 
-            if not data.size:
-                time.sleep(max(interval - time.time() + start, 0))
-                continue
-            
-            for f in np.arange(0, frequency_range, bar_width_range):
-                amps = np.array(data)
-                amps = amps[(f-bar_width_range<amps[:,0]) & (amps[:,0]<f)]
+            bar_width_range = 1 / self.resolution
+            bars_samples = np.array([])
+            bass_amplitude = data[data[:,0]<bass_frequency].max()
+
+            for f in np.arange(0, 1, bar_width_range):
+                amps = data[(f-bar_width_range<data[:,0]) & (data[:,0]<f)]
                 if not amps.size:
                     bars_samples = np.append(bars_samples, 0)
                 else:
                     bars_samples = np.append(bars_samples, amps.max())
 
             for n, amp in enumerate(bars_samples):
-                if bars[n] > 0 and amp < bars[n]:
-                        bars[n] -= bars[n] / 3
-                        if bars[n] < 1:
-                            bars[n] = 0
+                if amp > self.max_sample:
+                    amp = self.max_sample
+                elif bars[n] > 0 and amp < bars[n]:
+                    amp = bars[n] * (2/3)
                 else:
-                    bars[n] = amp
-                    if bars[n] < 1:
-                            bars[n] = 0
+                    amp *= self.amplify_factor
 
-            ax1.clear()
-            ax1.grid(False)
-            ax1.set_yticklabels([])
+                bars[n] = amp if amp > 1 else 0
+
+            ax.clear()
+            ax.grid(False)
             
-            thetas = np.arange(0, math.pi*2, (2*math.pi)/len(bars))
-            rs = bars
+            thetas = np.arange(0, math.pi*2, (2*math.pi)/(len(bars)*2))
+            rs = np.concatenate((bars, np.flip(bars)))
             if self.polar:
                 thetas = np.append(thetas, 0)
-                rs = np.append(rs, rs[0]) + max_sample/5
+                rs = np.append(rs, rs[0]) + self.max_sample/3
+                ax.set_rmax(self.max_sample)
             
-            if ax1.lines:
-                ax1.lines[0].set_data(thetas, rs)
+            ax.plot(thetas, rs, color=matplotlib_stroke, linewidth=5)
+            ax.set_ylim(top=self.max_sample, bottom=0)
+            ax.set_theta_zero_location('N')
+            ax.fill_between(thetas, rs, color=matplotlib_fill)
+            plt.axis('off')
+            plt.grid(b=None)
+
+            image_io = io.BytesIO()
+
+            canvas = plt.get_current_fig_manager().canvas
+            canvas.draw()
+            image = Image.frombytes('RGB', canvas.get_width_height(), canvas.tostring_rgb())
+            image = image.convert('RGBA')
+
+            white = (255, 255, 255, 255)
+            transparent = (0, 0, 0, 0)
+            data = np.array(image)
+            data[np.isin(data, (self.stroke_colour, self.fill_colour), invert=True).all(axis=-1)] = transparent
+            transparent_image = Image.fromarray(data, mode='RGBA')
+            
+            background = self.background_image.copy()
+            zoom = (bass_amplitude / self.max_sample)*(self.background_zoom - 1)
+            if current_background_zoom*(2/3) < zoom:
+                current_background_zoom = zoom
             else:
-                ax1.plot(thetas, rs, color='r')
-            ax1.set_ylim(top=max_sample, bottom=0)
-            if self.polar:
-                ax1.set_rmax(max_sample)
-            ax1.fill_between(thetas, rs, color='#c60303')
-            self.canvas.draw()
-            plt.pause(0.001)
-            time.sleep(max(interval - time.time() + start, 0))
+                current_background_zoom *= 0.5
+            final = self.zoom_background(background, current_background_zoom + 1)
+            # particles_gif = next(self.particle_frames).resize((1920, 1080))
+            # particles_gif.show()
+            # final.paste(particles_gif, (0, 0), particles_gif)
+            final.paste(transparent_image, (0, 0), transparent_image)
+
+            cv2_image = np.array(final)
+            cv2_image = cv2_image[:, :, ::-1].copy()
+
+            video.write(cv2_image)
+
+            self.progress.emit(timestamp)
+
+        cv2.destroyAllWindows()
+        video.release()
+        subprocess.call(f'ffmpeg -i tmp.mp4 -i {self.audio_file} -codec copy -shortest -y {self.video_output}')
+        os.remove('tmp.mp4')
